@@ -7,6 +7,7 @@ from datetime import datetime
 from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
+import torch.distributed as dist
 
 
 def main():
@@ -46,7 +47,8 @@ def main():
     samples = outputs['samples']
     
     # Save samples
-    if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
+    # if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
+    if dist.get_rank() == 0:
         for i, sample in enumerate(samples):
             sample = samples[i].unsqueeze(0)
             time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")

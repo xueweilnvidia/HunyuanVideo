@@ -156,6 +156,7 @@ def attention(
     return out
 
 
+
 def parallel_attention(
     hybrid_seq_parallel_attn,
     q,
@@ -166,18 +167,17 @@ def parallel_attention(
     cu_seqlens_q,
     cu_seqlens_kv
 ):
+    print("q shape: ", q.device)
+    # print("hybrid_seq_parallel_attn device", hybrid_seq_parallel_attn.device)
     attn1 = hybrid_seq_parallel_attn(
-        None,
         q[:, :img_q_len, :, :],
         k[:, :img_kv_len, :, :],
         v[:, :img_kv_len, :, :],
-        dropout_p=0.0,
-        causal=False,
-        joint_tensor_query=q[:,img_q_len:cu_seqlens_q[1]],
-        joint_tensor_key=k[:,img_kv_len:cu_seqlens_kv[1]],
-        joint_tensor_value=v[:,img_kv_len:cu_seqlens_kv[1]],
-        joint_strategy="rear",
+        core_attention_bias_type="no_bias",
+        core_attention_bias=None
     )
+    attn1 = attn1.reshape(q[:, :img_q_len, :, :].shape)
+    print("attn1: ", attn1.shape)
     if flash_attn.__version__ >= '2.7.0':
         attn2, *_ = _flash_attn_forward(
             q[:,cu_seqlens_q[1]:],
@@ -188,7 +188,6 @@ def parallel_attention(
             causal=False,
             window_size_left=-1,
             window_size_right=-1,
-            softcap=0.0,
             alibi_slopes=None,
             return_softmax=False,
         )
@@ -201,10 +200,10 @@ def parallel_attention(
             softmax_scale=q.shape[-1] ** (-0.5),
             causal=False,
             window_size=(-1, -1),
-            softcap=0.0,
             alibi_slopes=None,
             return_softmax=False,
         )
+    print("attn2: ", attn2.shape)
     attn = torch.cat([attn1, attn2], dim=1)
     b, s, a, d = attn.shape
     attn = attn.reshape(b, s, -1)

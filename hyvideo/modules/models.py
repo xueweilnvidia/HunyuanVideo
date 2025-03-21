@@ -1,9 +1,11 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -16,6 +18,8 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+
+from transformer_engine.pytorch.attention import DotProductAttention
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -140,6 +144,7 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print("vec shape: ", vec.shape)
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -148,6 +153,10 @@ class MMDoubleStreamBlock(nn.Module):
             img_mod2_scale,
             img_mod2_gate,
         ) = self.img_mod(vec).chunk(6, dim=-1)
+        # print("img_mod1_shift: ", img_mod1_shift.shape)
+        # print("img_mod1_scale: ", img_mod1_scale.shape)
+        # print("img_mod1_gate: ", img_mod1_gate.shape)
+        # print("img_mod2_shift: ", img_mod2_shift.shape)
         (
             txt_mod1_shift,
             txt_mod1_scale,
@@ -195,6 +204,10 @@ class MMDoubleStreamBlock(nn.Module):
         q = torch.cat((img_q, txt_q), dim=1)
         k = torch.cat((img_k, txt_k), dim=1)
         v = torch.cat((img_v, txt_v), dim=1)
+        print("q shape: ", q.shape)
+        print("img q shape: ", img_q.shape)
+        print("txt q shape: ", txt_q.shape)
+        print("cu_seqlens_q: ", cu_seqlens_q)
         assert (
             cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
@@ -530,6 +543,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             self.text_states_dim_2, self.hidden_size, **factory_kwargs
         )
 
+
         # guidance modulation
         self.guidance_in = (
             TimestepEmbedder(
@@ -538,6 +552,23 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             if guidance_embed
             else None
         )
+
+        head_dim  = int(self.hidden_size / self.heads_num)
+        print ("head dim: ", head_dim)
+        print("head num: ", self.heads_num)
+        os.environ["NVTE_FLASH_ATTN"] = "1"
+        cp_comm_ranks = range(dist.get_world_size()) 
+        self.attn_op = DotProductAttention(
+                self.heads_num,
+                head_dim,
+                attention_dropout=0,
+                qkv_format="bshd",
+                attn_mask_type="no_mask",
+                cp_global_ranks=list(cp_comm_ranks),
+                cp_group=dist.new_group(cp_comm_ranks, backend="nccl"),
+                cp_stream=torch.cuda.Stream(),
+                cp_comm_type="a2a",
+        ).to(device)
 
         # double blocks
         self.double_blocks = nn.ModuleList(
@@ -571,6 +602,9 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 for _ in range(mm_single_blocks_depth)
             ]
         )
+
+        for block in self.double_blocks + self.single_blocks:
+            block.hybrid_seq_parallel_attn = self.attn_op
 
         self.final_layer = FinalLayer(
             self.hidden_size,
@@ -650,7 +684,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         max_seqlen_q = img_seq_len + txt_seq_len
         max_seqlen_kv = max_seqlen_q
 
+        # print("img: ", img.shape)
+        # print("txt: ", txt.shape)
+        # print("vec: ", vec.shape)
+        # print("cu_seqlens_q: ", cu_seqlens_q)
+        # print("cu_seqlens_kv: ", cu_seqlens_kv) 
+
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+        # if freqs_cos is not None:
+        #     print("freqs_cos: ", freqs_cos.shape)
+        #     print("freqs_sin: ", freqs_sin.shape)
         # --------------------- Pass through DiT blocks ------------------------
         for _, block in enumerate(self.double_blocks):
             double_block_args = [

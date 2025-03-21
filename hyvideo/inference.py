@@ -54,10 +54,12 @@ def parallelize_transformer(pipe):
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         return_dict: bool = True,
     ):
-        if x.shape[-2] // 2 % get_sequence_parallel_world_size() == 0:
+        print("word_size: ", dist.get_world_size())
+        print("current rank: ", dist.get_rank())
+        if x.shape[-2] // 2 % dist.get_world_size() == 0:
             # try to split x by height
             split_dim = -2
-        elif x.shape[-1] // 2 % get_sequence_parallel_world_size() == 0:
+        elif x.shape[-1] // 2 % dist.get_world_size() == 0:
             # try to split x by width
             split_dim = -1
         else:
@@ -66,21 +68,23 @@ def parallelize_transformer(pipe):
         # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
         temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
 
-        x = torch.chunk(x, get_sequence_parallel_world_size(),dim=split_dim)[get_sequence_parallel_rank()]
+        print("x shape before split: ", x.shape)
+        x = torch.chunk(x, dist.get_world_size(),dim=split_dim)[dist.get_rank()]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
-        freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_cos = torch.chunk(freqs_cos, dist.get_world_size(),dim=split_dim - 1)[dist.get_rank()]
         freqs_cos = freqs_cos.reshape(-1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
-        freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_sin = torch.chunk(freqs_sin, dist.get_world_size(),dim=split_dim - 1)[dist.get_rank()]
         freqs_sin = freqs_sin.reshape(-1, dim_thw)
+
+        print("x shape after split: ", x.shape)
+        # from xfuser.core.long_ctx_attention import xFuserLongContextAttention
         
-        from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-        
-        for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+        # for block in transformer.double_blocks + transformer.single_blocks:
+        #     block.hybrid_seq_parallel_attn = attn_op
 
         output = original_forward(
             x,
@@ -96,8 +100,13 @@ def parallelize_transformer(pipe):
 
         return_dict = not isinstance(output, tuple)
         sample = output["x"]
-        sample = get_sp_group().all_gather(sample, dim=split_dim)
-        output["x"] = sample
+        print("sample: ", sample.shape)
+        sample_list = [torch.zeros_like(sample) for _ in range(dist.get_world_size())]
+        # sample = get_sp_group().all_gather(sample, dim=split_dim)
+        torch.distributed.all_gather(sample_list, sample)
+        full_sample = torch.concat(sample_list, dim=split_dim)
+        print("full sample shape: ", full_sample.shape)
+        output["x"] = full_sample
         return output
 
     new_forward = new_forward.__get__(transformer)
@@ -154,7 +163,14 @@ class Inference(object):
         logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
         
         # ==================== Initialize Distributed Environment ================
-        if args.ulysses_degree > 1 or args.ring_degree > 1:
+        custom = True
+        if custom:
+            dist.init_process_group("nccl")
+            print("local rank: ", dist.get_rank())
+            device = torch.device(f"cuda:{dist.get_rank()}")
+            torch.cuda.set_device(device)
+
+        elif args.ulysses_degree > 1 or args.ring_degree > 1:
             assert xfuser is not None, \
                 "Ulysses Attention and Ring Attention requires xfuser package."
 
@@ -350,7 +366,7 @@ class Inference(object):
                     f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
                     f"are: {list(state_dict.keys())}."
                 )
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(state_dict, strict=False)
         return model
 
     @staticmethod
@@ -406,6 +422,10 @@ class HunyuanVideoSampler(Inference):
 
         self.default_negative_prompt = NEGATIVE_PROMPT
         if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
+            parallelize_transformer(self.pipeline)
+        
+        custom = True
+        if custom:
             parallelize_transformer(self.pipeline)
 
     def load_diffusion_pipeline(
