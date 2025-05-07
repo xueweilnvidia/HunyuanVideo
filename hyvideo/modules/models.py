@@ -224,8 +224,11 @@ class MMDoubleStreamBlock(nn.Module):
             )
             
         # attention computation end
+        # print("attn shape: ", attn.shape)
+        # print("img q length: ", img_q.shape[1])
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
+        # print("txt_attn:", txt_attn.shape)
 
         # Calculate the img bloks.
         img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)

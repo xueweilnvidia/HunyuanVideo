@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from st_attn import sliding_tile_attention
 
 try:
     import flash_attn
@@ -105,19 +106,46 @@ def attention(
             q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
         )
     elif mode == "flash":
-        x = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            max_seqlen_q,
-            max_seqlen_kv,
-        )
+        # print(q.shape)
+        # print(cu_seqlens_q)
+        # x = flash_attn_varlen_func(
+        #     q,
+        #     k,
+        #     v,
+        #     cu_seqlens_q,
+        #     cu_seqlens_kv,
+        #     max_seqlen_q,
+        #     max_seqlen_kv,
+        # )
+        
+        Q = q[:cu_seqlens_q[1], :, :].transpose(0, 1).unsqueeze(0)
+        K = k[:cu_seqlens_kv[1], :, :].transpose(0, 1).unsqueeze(0)
+        V = v[:cu_seqlens_kv[1], :, :].transpose(0, 1).unsqueeze(0)
+
+        text_len = cu_seqlens_q[1] - 115200
+
+        o = sliding_tile_attention(Q, K, V, [(5, 6, 10)] * 24, text_len, True)
+        o = o.transpose(1, 2)
+        # print(o.shape)
+
+        pad_len = max_seqlen_q - cu_seqlens_q[1]
+        pad_o = flash_attn_varlen_func(
+            q[cu_seqlens_q[1]:, :, :],
+            k[cu_seqlens_kv[1]:, :, :],
+            v[cu_seqlens_kv[1]:, :, :],
+            torch.tensor([0, pad_len], dtype=torch.int32, device="cuda"),
+            torch.tensor([0, pad_len], dtype=torch.int32, device="cuda"),
+            pad_len,
+            pad_len,
+        ).unsqueeze(0)
+
+        # print(pad_o.shape)
+
         # x with shape [(bxs), a, d]
-        x = x.view(
-            batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
-        )  # reshape x to [b, s, a, d]
+        # x = x.view(
+        #     batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
+        # )  # reshape x to [b, s, a, d]
+        x = torch.concat([o, pad_o], dim = 1)
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 
